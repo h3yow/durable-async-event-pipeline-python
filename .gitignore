@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地运行产生的 SQLite 数据文件
+pipeline.db
+pipeline.db-wal
+pipeline.db-shm
+*.db
