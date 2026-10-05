@@ -16,9 +16,16 @@ import sqlite3
 import threading
 from typing import Any
 
-from app.models import DeadLetterView, EventRecord, EventStatus, StatusView
+from app.models import (
+    DeadLetterView,
+    EventRecord,
+    EventStatus,
+    RedriveReportItem,
+    RedriveOutcome,
+    StatusView,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _DDL = """
 PRAGMA journal_mode=WAL;
@@ -58,6 +65,21 @@ CREATE TABLE IF NOT EXISTS account_balances (
     account TEXT PRIMARY KEY,
     balance REAL NOT NULL DEFAULT 0
 );
+
+-- 死信重新驱动审计：每次驱动调用（redrive_id）与事件的对应关系留痕。
+-- UNIQUE(redrive_id, event_id) 保证同一次驱动被重复/并发发起时，
+-- 同一事件只会被记录（并驱动）一次。
+CREATE TABLE IF NOT EXISTS redrive_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    redrive_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    aggregate_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    redriven_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(redrive_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS ix_redrive_audit_id
+    ON redrive_audit(redrive_id);
 """
 
 
@@ -382,6 +404,181 @@ class EventStore:
             )
             conn.commit()
             return ids
+
+    # ---- 死信重新驱动 --------------------------------------------------------
+    def redrive_dead_letters(
+        self,
+        redrive_id: str,
+        aggregate_key: str | None = None,
+        event_type: str | None = None,
+        event_ids: list[str] | None = None,
+        limit: int = 100,
+    ) -> tuple[int, list[tuple[str, str, str, RedriveOutcome, str]]]:
+        """把符合条件的死信事件重新投入调度（单事务、幂等）。
+
+        返回 (命中死信总数, 逐条结果)，逐条结果为
+        (event_id, aggregate_key, event_type, outcome, detail)。
+
+        幂等与并发保障：
+            * 状态流转是条件 UPDATE ... WHERE status='DEAD_LETTER'：
+              并发/重复驱动下只有一个调用能把事件翻回 RETRY_WAIT，
+              其余调用影响行数为 0，识别为“已被驱动”；
+            * redrive_audit UNIQUE(redrive_id, event_id)：同一次驱动
+              （同一 redrive_id）重复发起时不会留下第二条审计；
+            * 事件保留原 seq 与内容，仅重置 attempts=0（给予新的重试预算）、
+              not_before=now，因此它回到维度内原有的处理次序，不插队。
+        """
+        outcomes: list[tuple[str, str, str, RedriveOutcome, str]] = []
+        with self._write_lock:
+            conn = self.conn
+            where = ["status=?"]
+            args: list[Any] = [EventStatus.DEAD_LETTER.value]
+            if aggregate_key is not None:
+                where.append("aggregate_key=?")
+                args.append(aggregate_key)
+            if event_type is not None:
+                where.append("event_type=?")
+                args.append(event_type)
+            if event_ids is not None:
+                if not event_ids:
+                    return 0, []
+                where.append("event_id IN (%s)" % ",".join("?" * len(event_ids)))
+                args.extend(event_ids)
+            cond = " AND ".join(where)
+            matched = int(conn.execute(
+                f"SELECT COUNT(*) AS c FROM events WHERE {cond}", args
+            ).fetchone()["c"])
+            rows = conn.execute(
+                f"SELECT event_id, aggregate_key, event_type FROM events "
+                f"WHERE {cond} ORDER BY seq LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for r in rows:
+                    eid, key, etype = r["event_id"], r["aggregate_key"], r["event_type"]
+                    # 1) 同一 redrive_id 已驱动过该事件（含驱动后再次死亡的情形）：
+                    #    重复调用直接跳过，绝不再驱动第二次。
+                    dup = conn.execute(
+                        "SELECT 1 FROM redrive_audit WHERE redrive_id=? "
+                        "AND event_id=? LIMIT 1",
+                        (redrive_id, eid),
+                    ).fetchone()
+                    if dup:
+                        outcomes.append((eid, key, etype,
+                                         RedriveOutcome.SKIPPED_NOT_DEAD,
+                                         "already driven by this redrive_id"))
+                        continue
+                    # 2) 条件流转：并发驱动（不同 redrive_id）只有一个能成功。
+                    cur = conn.execute(
+                        "UPDATE events SET status=?, attempts=0, "
+                        "not_before=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+                        "last_error='', "
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE event_id=? AND status=?",
+                        (EventStatus.RETRY_WAIT.value, eid,
+                         EventStatus.DEAD_LETTER.value),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO redrive_audit"
+                            "(redrive_id, event_id, aggregate_key, event_type) "
+                            "VALUES(?,?,?,?)",
+                            (redrive_id, eid, key, etype),
+                        )
+                        outcomes.append((eid, key, etype,
+                                         RedriveOutcome.REDRIVEN, ""))
+                    else:
+                        outcomes.append((eid, key, etype,
+                                         RedriveOutcome.SKIPPED_NOT_DEAD,
+                                         "no longer DEAD_LETTER "
+                                         "(concurrent redrive)"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # 显式指定 event_ids 时，补充未命中死信集合的条目（不存在 / 不在死信）。
+        if event_ids is not None:
+            seen = {o[0] for o in outcomes}
+            for eid in event_ids:
+                if eid in seen:
+                    continue
+                rec = self.get_event(eid)
+                if rec is None:
+                    outcomes.append((eid, "", "",
+                                     RedriveOutcome.SKIPPED_NOT_FOUND,
+                                     "event does not exist"))
+                    continue
+                dup = self.conn.execute(
+                    "SELECT 1 FROM redrive_audit WHERE redrive_id=? "
+                    "AND event_id=? LIMIT 1",
+                    (redrive_id, eid),
+                ).fetchone()
+                detail = ("already driven by this redrive_id" if dup else
+                          f"current status {rec.status.value}")
+                outcomes.append((eid, rec.aggregate_key, rec.event_type,
+                                 RedriveOutcome.SKIPPED_NOT_DEAD, detail))
+        return matched, outcomes
+
+    def redrive_report_items(self, redrive_id: str) -> list[RedriveReportItem]:
+        """查询某次重新驱动的审计条目及每条事件当前的结果归类。"""
+        rows = self.conn.execute(
+            "SELECT a.event_id, a.aggregate_key, a.event_type, a.redriven_at, "
+            "e.status, e.attempts "
+            "FROM redrive_audit a LEFT JOIN events e ON e.event_id=a.event_id "
+            "WHERE a.redrive_id=? ORDER BY a.id",
+            (redrive_id,),
+        ).fetchall()
+        items: list[RedriveReportItem] = []
+        for r in rows:
+            status = EventStatus(r["status"]) if r["status"] else None
+            items.append(RedriveReportItem(
+                event_id=r["event_id"],
+                aggregate_key=r["aggregate_key"],
+                event_type=r["event_type"],
+                redriven_at=r["redriven_at"],
+                outcome=self._classify_redrive_outcome(status),
+                event_status=status,
+                attempts=int(r["attempts"]) if r["attempts"] is not None else 0,
+            ))
+        return items
+
+    def redrive_summary_counts(self) -> dict[str, int]:
+        """全部重新驱动活动的汇总计数（按当前事件状态归类）。"""
+        rows = self.conn.execute(
+            "SELECT a.redrive_id, e.status FROM redrive_audit a "
+            "LEFT JOIN events e ON e.event_id=a.event_id"
+        ).fetchall()
+        counts = {
+            "total_redrives": 0, "total_events": 0,
+            "succeeded": 0, "in_flight": 0, "failed_again": 0,
+        }
+        ids: set[str] = set()
+        for r in rows:
+            ids.add(r["redrive_id"])
+            counts["total_events"] += 1
+            status = EventStatus(r["status"]) if r["status"] else None
+            outcome = self._classify_redrive_outcome(status)
+            if outcome == RedriveOutcome.SUCCEEDED:
+                counts["succeeded"] += 1
+            elif outcome == RedriveOutcome.FAILED_AGAIN:
+                counts["failed_again"] += 1
+            else:
+                counts["in_flight"] += 1
+        counts["total_redrives"] = len(ids)
+        return counts
+
+    @staticmethod
+    def _classify_redrive_outcome(status: EventStatus | None) -> RedriveOutcome:
+        """由事件当前状态推导重新驱动后的结果归类。"""
+        if status == EventStatus.COMPLETED:
+            return RedriveOutcome.SUCCEEDED
+        if status == EventStatus.DEAD_LETTER:
+            return RedriveOutcome.FAILED_AGAIN
+        # PENDING / IN_PROGRESS / RETRY_WAIT（事件永不删除，None 不可达）
+        return RedriveOutcome.IN_FLIGHT
 
     # ---- 业务演示表（与事件状态同事务提交） --------------------------------
     def apply_account_delta(self, account: str, delta: float) -> None:

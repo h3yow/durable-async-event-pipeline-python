@@ -25,7 +25,9 @@ def client(store, registry):
 
     def loop_thread():
         asyncio.set_event_loop(loop)
-        loop.create_task(pipeline.start())
+        # 先完成 start() 再放行测试线程，避免 /health 在 dispatcher
+        # 尚未启动时读到 dispatcher_running=False 的竞态。
+        loop.run_until_complete(pipeline.start())
         ready.set()
         loop.run_forever()
 
@@ -102,6 +104,64 @@ def test_event_status_transitions_observable(client):
     assert body["event_type"] == "account.deposit"
 
     assert client.get("/events/does-not-exist").status_code == 404
+
+
+def test_redrive_endpoints(client):
+    import time
+
+    # 制造一条死信（不可重试，当次即死信）
+    client.post("/events", json={
+        "event_id": "rd1", "aggregate_key": "acct:rd-api",
+        "event_type": "service.always_bad", "payload": {},
+    })
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if client.get("/events/rd1").json()["status"] == "DEAD_LETTER":
+            break
+        time.sleep(0.01)
+    assert client.get("/events/rd1").json()["status"] == "DEAD_LETTER"
+
+    # 发起重新驱动（显式 event_ids + 自带幂等键）
+    r = client.post("/dead-letters/redrive", json={
+        "redrive_id": "rd-api-1", "event_ids": ["rd1", "ghost"],
+    })
+    assert r.status_code == 202
+    body = r.json()
+    assert body["redrive_id"] == "rd-api-1"
+    assert body["accepted"] == 1
+    items = {i["event_id"]: i for i in body["items"]}
+    assert items["rd1"]["outcome"] == "REDRIVEN"
+    assert items["ghost"]["outcome"] == "SKIPPED_NOT_FOUND"
+
+    # 同一 redrive_id 重放：不再驱动
+    r2 = client.post("/dead-letters/redrive", json={
+        "redrive_id": "rd-api-1", "event_ids": ["rd1"],
+    })
+    assert r2.status_code == 202 and r2.json()["accepted"] == 0
+
+    # 结果报告：always_bad 修复不了 → 再次失败回死信，可区分
+    deadline = time.time() + 3
+    report = None
+    while time.time() < deadline:
+        report = client.get("/redrives/rd-api-1").json()
+        if report["failed_again"] == 1:
+            break
+        time.sleep(0.01)
+    assert report["failed_again"] == 1
+    assert report["items"][0]["redriven_at"]
+
+    # 汇总可查；未知 redrive_id → 404；非法参数 → 422
+    summary = client.get("/redrives").json()
+    assert summary["total_redrives"] == 1 and summary["total_events"] == 1
+    assert summary["failed_again"] == 1
+    assert client.get("/redrives/nope").status_code == 404
+    assert client.post("/dead-letters/redrive", json={
+        "event_ids": "not-a-list"}).status_code == 422
+    assert client.post("/dead-letters/redrive", json={
+        "limit": 0}).status_code == 422
+
+    # 既有接口不受影响
+    assert client.get("/").json() == {"Hello": "World"}
 
 
 def test_aggregate_listing_and_dead_letters_query(client):

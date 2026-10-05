@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 from app.backoff import BackoffPolicy
 from app.errors import HandlerError, NonRetryableError, RetryableError
@@ -28,6 +29,12 @@ from app.models import (
     EventStatus,
     HandleContext,
     HandleDecision,
+    RedriveItemResult,
+    RedriveOutcome,
+    RedriveReport,
+    RedriveReportItem,
+    RedriveResult,
+    RedriveSummary,
     RejectReason,
     StatusView,
 )
@@ -51,6 +58,9 @@ class PipelineConfig:
     poll_interval: float = 0.02
     backoff: BackoffPolicy = field(default_factory=BackoffPolicy)
     handler_timeout: float = 10.0
+    # 单次重新驱动调用受理的事件数量上限：防止一次大批量驱动长时间占用
+    # 写事务、卡住正在运行的调度；超出部分由调用方分批再次发起。
+    redrive_batch_limit: int = 200
 
 
 class SimulatedCrash(BaseException):
@@ -224,6 +234,91 @@ class Pipeline:
 
     def list_dead_letters(self, limit: int = 100) -> list[DeadLetterView]:
         return self.store.list_dead_letters(limit)
+
+    # ---- 死信重新驱动 --------------------------------------------------------
+    def redrive_dead_letters(
+        self,
+        redrive_id: str | None = None,
+        aggregate_key: str | None = None,
+        event_type: str | None = None,
+        event_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> RedriveResult:
+        """把死信事件按条件重新投入调度（幂等：同一 redrive_id 只生效一次）。
+
+        * 选择条件：aggregate_key / event_type / 显式 event_ids（可组合）；
+        * 数量上限：limit 截断到 config.redrive_batch_limit，命中更多时
+          truncated=True，调用方可对剩余部分再次发起（换新 redrive_id）；
+        * 重新驱动后事件保留原 event_id / payload / seq，仅重置 attempts，
+          回到维度内原有次序，继续受顺序与副作用幂等约束；
+        * 同步返回受理结果；处理结果通过 redrive_report 异步查询。
+        """
+        rid = redrive_id or f"rd-{uuid4().hex}"
+        effective_limit = min(limit or self.config.redrive_batch_limit,
+                              self.config.redrive_batch_limit)
+        matched, rows = self.store.redrive_dead_letters(
+            rid,
+            aggregate_key=aggregate_key,
+            event_type=event_type,
+            event_ids=event_ids,
+            limit=effective_limit,
+        )
+        items = [
+            RedriveItemResult(
+                event_id=eid, aggregate_key=key, event_type=etype,
+                outcome=outcome, detail=detail,
+            )
+            for eid, key, etype, outcome, detail in rows
+        ]
+        accepted = sum(1 for i in items if i.outcome == RedriveOutcome.REDRIVEN)
+        truncated = matched > accepted and matched > effective_limit
+        for item in items:
+            logger.info(
+                "redrive=%s event=%s key=%s type=%s decision=%s %s",
+                rid, item.event_id, item.aggregate_key, item.event_type,
+                item.outcome.value, item.detail,
+            )
+        logger.info(
+            "redrive=%s matched=%d accepted=%d skipped=%d truncated=%s limit=%d",
+            rid, matched, accepted, len(items) - accepted,
+            truncated, effective_limit,
+        )
+        return RedriveResult(
+            redrive_id=rid,
+            accepted=accepted,
+            skipped=len(items) - accepted,
+            truncated=truncated,
+            matched=matched,
+            items=items,
+        )
+
+    def redrive_report(self, redrive_id: str) -> RedriveReport | None:
+        """查询某次重新驱动的结果报告（成功/重试中/再次失败可区分）。"""
+        items = self.store.redrive_report_items(redrive_id)
+        if not items:
+            return None
+        succeeded = sum(1 for i in items if i.outcome == RedriveOutcome.SUCCEEDED)
+        failed = sum(1 for i in items if i.outcome == RedriveOutcome.FAILED_AGAIN)
+        in_flight = len(items) - succeeded - failed
+        return RedriveReport(
+            redrive_id=redrive_id,
+            total=len(items),
+            succeeded=succeeded,
+            in_flight=in_flight,
+            failed_again=failed,
+            items=items,
+        )
+
+    def redrive_summary(self) -> RedriveSummary:
+        """全部重新驱动活动的汇总。"""
+        c = self.store.redrive_summary_counts()
+        return RedriveSummary(
+            total_redrives=c["total_redrives"],
+            total_events=c["total_events"],
+            succeeded=c["succeeded"],
+            in_flight=c["in_flight"],
+            failed_again=c["failed_again"],
+        )
 
     # ---- 调度 --------------------------------------------------------------
     async def _dispatch_loop(self) -> None:

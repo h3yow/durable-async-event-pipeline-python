@@ -106,6 +106,76 @@ class DeadLetterView:
     updated_at: str
 
 
+class RedriveOutcome(str, Enum):
+    """重新驱动后单条事件的归类结果（由审计记录 + 事件当前状态推导）。"""
+
+    REDRIVEN = "REDRIVEN"            # 本次调用成功把它从死信重新投入调度
+    SKIPPED_NOT_DEAD = "SKIPPED_NOT_DEAD"      # 已不在死信（被并发/重复驱动过）
+    SKIPPED_NOT_FOUND = "SKIPPED_NOT_FOUND"    # 指定的事件不存在
+    SUCCEEDED = "SUCCEEDED"          # 重新驱动后已成功跑完（COMPLETED）
+    IN_FLIGHT = "IN_FLIGHT"          # 重新驱动后仍在排队/重试/处理中
+    FAILED_AGAIN = "FAILED_AGAIN"    # 重新驱动后再次失败、回到死信
+
+
+@dataclass(slots=True)
+class RedriveItemResult:
+    """一次重新驱动调用中，单条事件的受理结果。"""
+
+    event_id: str
+    aggregate_key: str
+    event_type: str
+    outcome: RedriveOutcome
+    detail: str = ""
+
+
+@dataclass(slots=True)
+class RedriveResult:
+    """一次重新驱动调用的整体受理结果（同步返回，处理结果异步可查）。"""
+
+    redrive_id: str
+    accepted: int
+    skipped: int
+    truncated: bool          # 命中数量超过批量上限，只受理了前 limit 条
+    matched: int             # 按条件命中的死信总数（不受 limit 截断影响）
+    items: list[RedriveItemResult] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RedriveReportItem:
+    """重新驱动审计条目 + 该事件当前推导出的结果归类。"""
+
+    event_id: str
+    aggregate_key: str
+    event_type: str
+    redriven_at: str
+    outcome: RedriveOutcome
+    event_status: EventStatus | None
+    attempts: int
+
+
+@dataclass(slots=True)
+class RedriveReport:
+    """某次重新驱动（按 redrive_id）的可查询结果报告。"""
+
+    redrive_id: str
+    total: int
+    succeeded: int
+    in_flight: int
+    failed_again: int
+    items: list[RedriveReportItem] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RedriveSummary:
+    """全部重新驱动活动的汇总视图。"""
+
+    total_redrives: int
+    total_events: int
+    succeeded: int
+    in_flight: int
+    failed_again: int
+
+
 @dataclass(slots=True)
 class HandleContext:
     """处理器运行上下文：以 event_id 为幂等键登记业务副作用。

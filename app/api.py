@@ -102,6 +102,89 @@ def register_routes(app: FastAPI) -> None:
             ],
         })
 
+    @app.post("/dead-letters/redrive")
+    async def redrive_dead_letters(request: Request) -> JSONResponse:
+        raw = await request.json()
+        if not isinstance(raw, dict):
+            return JSONResponse(status_code=422, content={
+                "accepted": 0, "detail": "body must be a JSON object",
+            })
+        event_ids = raw.get("event_ids")
+        if event_ids is not None and not (
+            isinstance(event_ids, list)
+            and all(isinstance(e, str) for e in event_ids)
+        ):
+            return JSONResponse(status_code=422, content={
+                "accepted": 0, "detail": "event_ids must be a list of strings",
+            })
+        limit = raw.get("limit")
+        if limit is not None and not (isinstance(limit, int) and limit > 0):
+            return JSONResponse(status_code=422, content={
+                "accepted": 0, "detail": "limit must be a positive integer",
+            })
+        result = _svc(request).redrive_dead_letters(
+            redrive_id=raw.get("redrive_id"),
+            aggregate_key=raw.get("aggregate_key"),
+            event_type=raw.get("event_type"),
+            event_ids=event_ids,
+            limit=limit,
+        )
+        return JSONResponse(status_code=202, content={
+            "redrive_id": result.redrive_id,
+            "accepted": result.accepted,
+            "skipped": result.skipped,
+            "matched": result.matched,
+            "truncated": result.truncated,
+            "items": [
+                {
+                    "event_id": i.event_id,
+                    "aggregate_key": i.aggregate_key,
+                    "event_type": i.event_type,
+                    "outcome": i.outcome.value,
+                    "detail": i.detail,
+                }
+                for i in result.items
+            ],
+        })
+
+    @app.get("/redrives/{redrive_id}")
+    async def redrive_report(request: Request, redrive_id: str) -> JSONResponse:
+        report = _svc(request).redrive_report(redrive_id)
+        if report is None:
+            return JSONResponse(status_code=404, content={
+                "redrive_id": redrive_id, "status": "NOT_FOUND",
+            })
+        return JSONResponse(status_code=200, content={
+            "redrive_id": report.redrive_id,
+            "total": report.total,
+            "succeeded": report.succeeded,
+            "in_flight": report.in_flight,
+            "failed_again": report.failed_again,
+            "items": [
+                {
+                    "event_id": i.event_id,
+                    "aggregate_key": i.aggregate_key,
+                    "event_type": i.event_type,
+                    "redriven_at": i.redriven_at,
+                    "outcome": i.outcome.value,
+                    "event_status": i.event_status.value if i.event_status else None,
+                    "attempts": i.attempts,
+                }
+                for i in report.items
+            ],
+        })
+
+    @app.get("/redrives")
+    async def redrive_summary(request: Request) -> JSONResponse:
+        s = _svc(request).redrive_summary()
+        return JSONResponse(status_code=200, content={
+            "total_redrives": s.total_redrives,
+            "total_events": s.total_events,
+            "succeeded": s.succeeded,
+            "in_flight": s.in_flight,
+            "failed_again": s.failed_again,
+        })
+
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:
         svc = _svc(request)
