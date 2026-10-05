@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -28,6 +29,13 @@ from app.models import (
     EventStatus,
     HandleContext,
     HandleDecision,
+    RedriveEventResult,
+    RedriveFilter,
+    RedriveOutcome,
+    RedriveRecord,
+    RedriveResult,
+    RedriveStatusView,
+    RedriveSummary,
     RejectReason,
     StatusView,
 )
@@ -51,6 +59,9 @@ class PipelineConfig:
     poll_interval: float = 0.02
     backoff: BackoffPolicy = field(default_factory=BackoffPolicy)
     handler_timeout: float = 10.0
+    # 死信重新驱动：单批次数量上限与分批事务大小（避免大批量卡住调度）
+    redrive_max_batch: int = 200
+    redrive_chunk_size: int = 50
 
 
 class SimulatedCrash(BaseException):
@@ -111,6 +122,9 @@ class Pipeline:
         # 本进程内已发生模拟崩溃的维度：worker 退出后不再被 dispatcher 重启，
         # 直到 stop()/重启（真实进程死亡后只有重启才会恢复这些事件）。
         self._crashed_keys: set[str] = set()
+        # 同一 batch_id 的重新驱动在本进程内串行化：并发重复提交等待首次执行
+        # 完成后按“重放已记录结果”返回（跨进程/线程由 store 层条件写兜底）。
+        self._batch_locks: dict[str, asyncio.Lock] = {}
 
     # ---- 生命周期 ----------------------------------------------------------
     async def start(self) -> None:
@@ -224,6 +238,154 @@ class Pipeline:
 
     def list_dead_letters(self, limit: int = 100) -> list[DeadLetterView]:
         return self.store.list_dead_letters(limit)
+
+    # ---- 死信重新驱动（redrive） --------------------------------------------
+    async def redrive(
+        self, filt: RedriveFilter, batch_id: str | None = None
+    ) -> RedriveResult:
+        """把符合条件的死信重新投入处理（保留事件身份/内容/原次序）。
+
+        幂等：batch_id 唯一，重复/并发提交同批次只生效一次；单事件用条件
+        UPDATE 兜底，跨批次并发也不会把同一事件驱动两次。
+        分批：每 redrive_chunk_size 条一个事务并让出事件循环，不阻塞调度。
+        """
+        batch_id = batch_id or f"redrive-{uuid.uuid4().hex[:12]}"
+        lock = self._batch_locks.setdefault(batch_id, asyncio.Lock())
+        async with lock:
+            try:
+                return await self._redrive_locked(filt, batch_id)
+            finally:
+                # 锁释放后即可清理；晚到的重复提交会重建锁并由 batch 唯一约束拦截
+                if self._batch_locks.get(batch_id) is lock:
+                    del self._batch_locks[batch_id]
+
+    async def _redrive_locked(self, filt: RedriveFilter, batch_id: str) -> RedriveResult:
+        limit = filt.limit if filt.limit is not None else self.config.redrive_max_batch
+        limit = max(0, min(limit, self.config.redrive_max_batch))
+        filter_json = json.dumps({
+            "aggregate_key": filt.aggregate_key,
+            "event_type": filt.event_type,
+            "event_ids": list(filt.event_ids) if filt.event_ids else None,
+            "limit": filt.limit,
+        }, sort_keys=True)
+
+        if not self.store.try_begin_batch(batch_id, filter_json):
+            # 同一 batch_id 已执行过：直接返回首次执行的结果，不重复驱动。
+            b = self.store.get_batch(batch_id) or {}
+            records = self.store.list_redrive_records(batch_id=batch_id, limit=limit or 1)
+            logger.warning(
+                "redrive batch=%s decision=DUPLICATE already executed "
+                "(redriven=%d skipped=%d); replaying recorded result",
+                batch_id, b.get("redriven", 0), b.get("skipped", 0),
+            )
+            return RedriveResult(
+                batch_id=batch_id, duplicate=True,
+                matched=b.get("matched", 0), redriven=b.get("redriven", 0),
+                skipped=b.get("skipped", 0), truncated=b.get("truncated", False),
+                events=[
+                    RedriveEventResult(r.event_id, r.aggregate_key, r.event_type, True)
+                    for r in records
+                ],
+            )
+
+        # 多取 1 条用于判断是否被上限截断
+        candidates = self.store.select_dead_letters(
+            filt.aggregate_key, filt.event_type,
+            list(filt.event_ids) if filt.event_ids is not None else None,
+            limit + 1,
+        )
+        truncated = len(candidates) > limit
+        candidates = candidates[:limit]
+
+        events: list[RedriveEventResult] = []
+        redriven = skipped = 0
+        chunk = max(1, self.config.redrive_chunk_size)
+        for i in range(0, len(candidates), chunk):
+            for rec in candidates[i:i + chunk]:
+                out = self.store.redrive_one(batch_id, rec.event_id, iso(utc_now()))
+                if out is None:
+                    skipped += 1
+                    events.append(RedriveEventResult(
+                        rec.event_id, rec.aggregate_key, rec.event_type, False,
+                        "no longer DEAD_LETTER (claimed by concurrent redrive)",
+                    ))
+                    logger.warning(
+                        "redrive batch=%s event=%s decision=SKIP not DEAD_LETTER "
+                        "(concurrent redrive won)", batch_id, rec.event_id,
+                    )
+                    continue
+                redriven += 1
+                events.append(RedriveEventResult(
+                    rec.event_id, rec.aggregate_key, rec.event_type, True,
+                ))
+                logger.info(
+                    "redrive batch=%s event=%s key=%s type=%s prior_error=%r "
+                    "decision=REDRIVE -> PENDING (seq=%d preserved, attempts reset)",
+                    batch_id, rec.event_id, rec.aggregate_key, rec.event_type,
+                    rec.last_error, rec.seq,
+                )
+            # 每个分批事务后让出事件循环：大批量重新驱动不卡住 dispatcher，
+            # 也不影响其他维度继续推进。
+            await asyncio.sleep(0)
+
+        self.store.finish_batch(batch_id, len(candidates), redriven, skipped, truncated)
+        logger.info(
+            "redrive batch=%s matched=%d redriven=%d skipped=%d truncated=%s",
+            batch_id, len(candidates), redriven, skipped, truncated,
+        )
+        return RedriveResult(
+            batch_id=batch_id, duplicate=False, matched=len(candidates),
+            redriven=redriven, skipped=skipped, truncated=truncated, events=events,
+        )
+
+    def redrive_status(self, event_id: str) -> RedriveStatusView | None:
+        """单事件重新驱动后的结果（成功/仍在重试/再次失败）；未驱动过返回 None。"""
+        rec = self.store.latest_redrive_record(event_id)
+        if rec is None:
+            return None
+        view = self.store.status_view(event_id)
+        if view is None:  # pragma: no cover - 审计存在则事件必然存在
+            return None
+        if view.status == EventStatus.COMPLETED:
+            outcome = RedriveOutcome.SUCCEEDED
+        elif view.status == EventStatus.DEAD_LETTER:
+            outcome = RedriveOutcome.FAILED_AGAIN
+        else:
+            outcome = RedriveOutcome.IN_PROGRESS
+        return RedriveStatusView(
+            event_id=event_id, batch_id=rec.batch_id, redriven_at=rec.redriven_at,
+            outcome=outcome, status=view.status, attempts=view.attempts,
+            last_error=view.last_error,
+        )
+
+    def list_redrive_records(
+        self, event_id: str | None = None, batch_id: str | None = None, limit: int = 200
+    ) -> list[RedriveRecord]:
+        """审计查询：哪些事件、什么时间、在哪个批次被重新驱动过。"""
+        return self.store.list_redrive_records(event_id, batch_id, limit)
+
+    def redrive_summary(self) -> RedriveSummary:
+        """汇总：批次数、重新驱动总条数、按“事件最新一次驱动”的当前结果分类。"""
+        records = self.store.list_redrive_records(limit=1_000_000)
+        latest_by_event: dict[str, RedriveRecord] = {}
+        for r in records:  # id 升序，后者覆盖前者 → 每事件保留最新一次驱动
+            latest_by_event[r.event_id] = r
+        succeeded = in_progress = failed_again = 0
+        for event_id in latest_by_event:
+            st = self.redrive_status(event_id)
+            if st is None:
+                continue
+            if st.outcome == RedriveOutcome.SUCCEEDED:
+                succeeded += 1
+            elif st.outcome == RedriveOutcome.FAILED_AGAIN:
+                failed_again += 1
+            else:
+                in_progress += 1
+        return RedriveSummary(
+            total_batches=self.store.count_batches(),
+            total_redriven=self.store.count_redrive_audit(),
+            succeeded=succeeded, in_progress=in_progress, failed_again=failed_again,
+        )
 
     # ---- 调度 --------------------------------------------------------------
     async def _dispatch_loop(self) -> None:

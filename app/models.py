@@ -10,6 +10,8 @@
       └─(startup / lease sweep 中断恢复)── IN_PROGRESS 重置为 RETRY_WAIT
 
     IN_PROGRESS / RETRY_WAIT ──non-retryable 或 attempts 耗尽──▶ DEAD_LETTER
+                                                                    │
+    DEAD_LETTER ──redrive（运维重新驱动）──▶ PENDING（保留原 seq，回到原处理次序）
 
 另外：
     * 结构非法事件（enqueue 时校验）→ REJECTED（不进入调度，可观测）
@@ -47,6 +49,84 @@ class HandleDecision(str, Enum):
     OK = "OK"
     RETRYABLE = "RETRYABLE"
     NON_RETRYABLE = "NON_RETRYABLE"
+
+
+class RedriveOutcome(str, Enum):
+    """死信重新驱动之后的结果（由审计记录 + 事件当前状态推导，可查询）。"""
+
+    SUCCEEDED = "SUCCEEDED"        # 重新驱动后成功：事件已 COMPLETED
+    IN_PROGRESS = "IN_PROGRESS"    # 重新驱动后仍在排队/退避重试
+    FAILED_AGAIN = "FAILED_AGAIN"  # 重新驱动后再次失败：又回到 DEAD_LETTER
+
+
+@dataclass(frozen=True, slots=True)
+class RedriveFilter:
+    """挑选待重新驱动死信的条件（可组合；全空表示“全部死信”，仍受上限约束）。"""
+
+    aggregate_key: str | None = None
+    event_type: str | None = None
+    event_ids: tuple[str, ...] | None = None
+    limit: int | None = None
+
+
+@dataclass(slots=True)
+class RedriveEventResult:
+    """批次内单个事件的重新驱动结果。"""
+
+    event_id: str
+    aggregate_key: str
+    event_type: str
+    redriven: bool          # False = 被跳过（已不在死信/被并发批次抢走）
+    detail: str = ""
+
+
+@dataclass(slots=True)
+class RedriveResult:
+    """一次重新驱动批次的汇总结果（重复提交同 batch_id 时原样返回）。"""
+
+    batch_id: str
+    duplicate: bool          # True = 该 batch_id 已执行过，本次为重放
+    matched: int             # 过滤条件命中的死信数（上限截断后）
+    redriven: int            # 实际重新入队数
+    skipped: int             # 命中但被跳过（并发竞争下已不在死信）
+    truncated: bool          # 命中数因到达批量上限被截断
+    events: list[RedriveEventResult] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RedriveRecord:
+    """审计：某事件在某批次中被重新驱动过（落库留痕）。"""
+
+    batch_id: str
+    event_id: str
+    aggregate_key: str
+    event_type: str
+    prior_error: str         # 重新驱动前最后一次失败原因
+    redriven_at: str
+
+
+@dataclass(slots=True)
+class RedriveStatusView:
+    """单事件“重新驱动后结果”的查询视图。"""
+
+    event_id: str
+    batch_id: str
+    redriven_at: str
+    outcome: RedriveOutcome
+    status: EventStatus
+    attempts: int
+    last_error: str
+
+
+@dataclass(slots=True)
+class RedriveSummary:
+    """重新驱动汇总（全部批次）。"""
+
+    total_batches: int
+    total_redriven: int
+    succeeded: int
+    in_progress: int
+    failed_again: int
 
 
 @dataclass(frozen=True, slots=True)

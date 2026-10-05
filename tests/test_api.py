@@ -25,7 +25,7 @@ def client(store, registry):
 
     def loop_thread():
         asyncio.set_event_loop(loop)
-        loop.create_task(pipeline.start())
+        loop.run_until_complete(pipeline.start())   # 启动完成后再放行，消除竞态
         ready.set()
         loop.run_forever()
 

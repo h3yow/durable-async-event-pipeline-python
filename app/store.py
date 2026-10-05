@@ -16,9 +16,9 @@ import sqlite3
 import threading
 from typing import Any
 
-from app.models import DeadLetterView, EventRecord, EventStatus, StatusView
+from app.models import DeadLetterView, EventRecord, EventStatus, RedriveRecord, StatusView
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _DDL = """
 PRAGMA journal_mode=WAL;
@@ -58,6 +58,31 @@ CREATE TABLE IF NOT EXISTS account_balances (
     account TEXT PRIMARY KEY,
     balance REAL NOT NULL DEFAULT 0
 );
+
+-- 死信重新驱动：批次表（batch_id 唯一 → 同一批次重复/并发提交只生效一次）
+CREATE TABLE IF NOT EXISTS redrive_batches (
+    batch_id TEXT PRIMARY KEY,
+    filter_json TEXT NOT NULL DEFAULT '{}',
+    matched INTEGER NOT NULL DEFAULT 0,
+    redriven INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- 死信重新驱动：审计表（哪些事件、什么时间、在哪个批次被重新驱动）
+CREATE TABLE IF NOT EXISTS redrive_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    aggregate_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    prior_error TEXT NOT NULL DEFAULT '',
+    redriven_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(batch_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS ix_redrive_audit_event
+    ON redrive_audit(event_id);
 """
 
 
@@ -415,3 +440,155 @@ class EventStore:
             sql += " AND name=?"
             args.append(name)
         return int(self.conn.execute(sql, args).fetchone()["c"])
+
+    # ---- 死信重新驱动（redrive） --------------------------------------------
+    @staticmethod
+    def _row_to_redrive(r: sqlite3.Row) -> RedriveRecord:
+        return RedriveRecord(
+            batch_id=r["batch_id"],
+            event_id=r["event_id"],
+            aggregate_key=r["aggregate_key"],
+            event_type=r["event_type"],
+            prior_error=r["prior_error"] or "",
+            redriven_at=r["redriven_at"],
+        )
+
+    def try_begin_batch(self, batch_id: str, filter_json: str) -> bool:
+        """登记批次；batch_id 已存在返回 False（重复/并发提交只生效一次）。"""
+        with self._write_lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO redrive_batches(batch_id, filter_json) VALUES(?,?)",
+                (batch_id, filter_json),
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+
+    def finish_batch(
+        self, batch_id: str, matched: int, redriven: int, skipped: int, truncated: bool
+    ) -> None:
+        """批次结束后回填统计。"""
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE redrive_batches SET matched=?, redriven=?, skipped=?, truncated=? "
+                "WHERE batch_id=?",
+                (matched, redriven, skipped, 1 if truncated else 0, batch_id),
+            )
+            self.conn.commit()
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM redrive_batches WHERE batch_id=?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "batch_id": row["batch_id"],
+            "filter_json": row["filter_json"],
+            "matched": row["matched"],
+            "redriven": row["redriven"],
+            "skipped": row["skipped"],
+            "truncated": bool(row["truncated"]),
+            "created_at": row["created_at"],
+        }
+
+    def select_dead_letters(
+        self,
+        aggregate_key: str | None,
+        event_type: str | None,
+        event_ids: list[str] | None,
+        limit: int,
+    ) -> list[EventRecord]:
+        """按过滤条件挑选死信（按 seq 升序 → 保持同维度原始次序）。"""
+        sql = "SELECT * FROM events WHERE status=?"
+        args: list[Any] = [EventStatus.DEAD_LETTER.value]
+        if aggregate_key is not None:
+            sql += " AND aggregate_key=?"
+            args.append(aggregate_key)
+        if event_type is not None:
+            sql += " AND event_type=?"
+            args.append(event_type)
+        if event_ids is not None:
+            if not event_ids:
+                return []
+            sql += f" AND event_id IN ({','.join('?' for _ in event_ids)})"
+            args.extend(event_ids)
+        sql += " ORDER BY seq LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(sql, args).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def redrive_one(self, batch_id: str, event_id: str, not_before_iso: str) -> EventRecord | None:
+        """单事件重新驱动：DEAD_LETTER -> PENDING + 审计，同一事务。
+
+        条件 UPDATE 保证并发/重复下同一事件只被驱动一次；事件不在死信时
+        返回 None（被跳过）。保留原 seq（回到原处理次序），attempts 归零
+        （获得全新重试预算），事件身份与内容不变。
+        """
+        conn = self.conn
+        with self._write_lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM events WHERE event_id=?", (event_id,)
+                ).fetchone()
+                if row is None or row["status"] != EventStatus.DEAD_LETTER.value:
+                    conn.rollback()
+                    return None
+                cur = conn.execute(
+                    "UPDATE events SET status=?, attempts=0, not_before=?, last_error='', "
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE event_id=? AND status=?",
+                    (EventStatus.PENDING.value, not_before_iso, event_id,
+                     EventStatus.DEAD_LETTER.value),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return None  # 并发下已被其他批次驱动
+                conn.execute(
+                    "INSERT INTO redrive_audit(batch_id, event_id, aggregate_key,"
+                    " event_type, prior_error) VALUES(?,?,?,?,?)",
+                    (batch_id, event_id, row["aggregate_key"], row["event_type"],
+                     row["last_error"] or ""),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            new_row = conn.execute(
+                "SELECT * FROM events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            return self._row_to_record(new_row)
+
+    def list_redrive_records(
+        self,
+        event_id: str | None = None,
+        batch_id: str | None = None,
+        limit: int = 200,
+    ) -> list[RedriveRecord]:
+        sql = "SELECT * FROM redrive_audit WHERE 1=1"
+        args: list[Any] = []
+        if event_id is not None:
+            sql += " AND event_id=?"
+            args.append(event_id)
+        if batch_id is not None:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        sql += " ORDER BY id LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(sql, args).fetchall()
+        return [self._row_to_redrive(r) for r in rows]
+
+    def latest_redrive_record(self, event_id: str) -> RedriveRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM redrive_audit WHERE event_id=? ORDER BY id DESC LIMIT 1",
+            (event_id,),
+        ).fetchone()
+        return self._row_to_redrive(row) if row else None
+
+    def count_batches(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) AS c FROM redrive_batches")
+                   .fetchone()["c"])
+
+    def count_redrive_audit(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) AS c FROM redrive_audit")
+                   .fetchone()["c"])
